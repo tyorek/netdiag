@@ -7,8 +7,10 @@ infers a star topology around the detected router/gateway, and renders
 an interactive HTML map with pyvis.
 
 This version has NO hardcoded networks. On launch it auto-detects the
-subnet(s) your machine is on. You can edit, add, or remove targets
-freely, and it remembers your last targets between runs.
+subnet(s) your machine is on, reading the REAL subnet mask from the OS
+(so a /28, /27, /23 etc. is reported correctly, not assumed as /24).
+You can edit, add, or remove targets freely, and it remembers your last
+targets between runs.
 
 Requirements:
     pip install python-nmap networkx pyvis
@@ -44,47 +46,108 @@ CONFIG_PATH = os.path.join(
 # --------------------------------------------------------------------------- #
 #  Network auto-detection helpers                                              #
 # --------------------------------------------------------------------------- #
-def detect_local_subnets():
-    """Return a de-duplicated list of CIDR subnets this machine is on.
-
-    Pure standard library, works on Windows/Linux/macOS. Falls back to
-    a /24 guess if the exact prefix length can't be determined.
-    """
-    subnets = []
-
-    # 1) Primary route: which local IP does traffic leave from?
+def _primary_ip():
+    """The local IP that outbound traffic leaves from (no packets sent)."""
     try:
         s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        s.connect(("8.8.8.8", 80))          # no packets actually sent
-        primary_ip = s.getsockname()[0]
+        s.connect(("8.8.8.8", 80))
+        ip = s.getsockname()[0]
         s.close()
-        subnets.append(f"{primary_ip}/24")
+        return ip
     except Exception:
-        pass
+        return None
 
-    # 2) Any other IPv4 addresses bound to this host.
+
+def _hexmask_to_prefix(hexstr):
+    """Convert a macOS-style hex netmask (e.g. 0xffffff00) to a prefix int."""
     try:
-        host = socket.gethostname()
-        for info in socket.getaddrinfo(host, None, socket.AF_INET):
-            ip = info[4][0]
-            if ip.startswith("127."):
-                continue
-            cidr = f"{ip}/24"
-            if cidr not in subnets:
-                subnets.append(cidr)
+        return bin(int(hexstr, 16)).count("1")
+    except Exception:
+        return None
+
+
+def _detect_ip_mask_pairs():
+    """Return [(ip, netmask_or_prefix), ...] read from the OS, real masks.
+
+    netmask may be a dotted string ('255.255.255.240') or an int prefix (28);
+    both are accepted by ipaddress.ip_network below.
+    """
+    pairs = []
+    try:
+        if os.name == "nt":
+            # Parse `ipconfig`: pair each "IPv4 Address" with the following
+            # "Subnet Mask" line within the same adapter block.
+            out = subprocess.check_output(["ipconfig"], text=True, errors="ignore")
+            pending_ip = None
+            for line in out.splitlines():
+                low = line.lower()
+                if "ipv4 address" in low and ":" in line:
+                    ip = line.split(":")[-1].strip()
+                    ip = ip.replace("(Preferred)", "").strip()
+                    pending_ip = ip
+                elif "subnet mask" in low and ":" in line and pending_ip:
+                    mask = line.split(":")[-1].strip()
+                    pairs.append((pending_ip, mask))
+                    pending_ip = None
+        else:
+            # Linux: `ip -o -f inet addr show` gives "inet 192.168.5.10/28 ..."
+            try:
+                out = subprocess.check_output(
+                    ["ip", "-o", "-f", "inet", "addr", "show"],
+                    text=True, errors="ignore")
+                for line in out.splitlines():
+                    toks = line.split()
+                    if "inet" in toks:
+                        cidr = toks[toks.index("inet") + 1]  # 192.168.5.10/28
+                        ip, _, prefix = cidr.partition("/")
+                        if prefix:
+                            pairs.append((ip, int(prefix)))
+            except Exception:
+                # macOS / BSD: "inet 192.168.5.10 netmask 0xfffffff0"
+                out = subprocess.check_output(["ifconfig"], text=True, errors="ignore")
+                for line in out.splitlines():
+                    toks = line.split()
+                    if "inet" in toks and "netmask" in toks:
+                        ip = toks[toks.index("inet") + 1]
+                        raw = toks[toks.index("netmask") + 1]
+                        prefix = _hexmask_to_prefix(raw) if raw.startswith("0x") else None
+                        if prefix is not None:
+                            pairs.append((ip, prefix))
     except Exception:
         pass
+    return pairs
 
-    # Normalise each to its network address (e.g. 192.168.1.37/24 -> 192.168.1.0/24)
+
+def detect_local_subnets():
+    """Return de-duplicated CIDR subnets this machine is on, using REAL masks.
+
+    Reads the actual subnet mask from the OS (ipconfig / ip / ifconfig) so a
+    /28, /27, /23, etc. is reported correctly instead of assuming /24. Only if
+    the OS lookup finds nothing do we fall back to a /24 guess.
+    """
+    primary = _primary_ip()
     cleaned = []
-    for cidr in subnets:
+
+    for ip, mask in _detect_ip_mask_pairs():
+        if not ip or ip.startswith("127."):
+            continue
         try:
-            net = ipaddress.ip_network(cidr, strict=False)
-            text = str(net)
-            if text not in cleaned:
-                cleaned.append(text)
+            net = ipaddress.ip_network(f"{ip}/{mask}", strict=False)
         except ValueError:
             continue
+        text = str(net)
+        if text in cleaned:
+            continue
+        # Put the subnet containing our primary outbound IP first.
+        if primary and ipaddress.ip_address(primary) in net:
+            cleaned.insert(0, text)
+        else:
+            cleaned.append(text)
+
+    # Fallback only if the OS gave us nothing usable.
+    if not cleaned and primary:
+        cleaned.append(str(ipaddress.ip_network(f"{primary}/24", strict=False)))
+
     return cleaned
 
 
@@ -134,7 +197,7 @@ class AutoNetworkDiagrammer:
         self.device_count = 0
 
     def scan_network(self, targets):
-        self.log("🔍 Scanning...")
+        self.log("\U0001F50D Scanning...")
         for target in targets:
             target = target.strip()
             if not target:
@@ -180,7 +243,7 @@ class AutoNetworkDiagrammer:
                     break
 
         if self.router_ip and self.router_ip in self.G:
-            self.log(f"🔗 Connecting devices to router: {self.router_ip}")
+            self.log(f"\U0001F517 Connecting devices to router: {self.router_ip}")
             for node in list(self.G.nodes):
                 if node != self.router_ip:
                     self.G.add_edge(self.router_ip, node, label="inferred")
@@ -190,7 +253,7 @@ class AutoNetworkDiagrammer:
             self.log("⚠️ Could not find a central router for edge inference.")
 
     def get_subnet(self, ip):
-        """Generic label: the /24 network the IP belongs to."""
+        """Label a host by the /24 block it sits in (display only)."""
         try:
             return str(ipaddress.ip_network(f"{ip}/24", strict=False))
         except ValueError:
@@ -267,7 +330,7 @@ class DiagrammerApp(tk.Tk):
 
         tgt_btns = ttk.Frame(tgt_frame)
         tgt_btns.pack(fill="x", padx=6, pady=(0, 6))
-        ttk.Button(tgt_btns, text="🔎 Detect my network",
+        ttk.Button(tgt_btns, text="\U0001F50E Detect my network",
                    command=self._detect_network).pack(side="left")
         ttk.Button(tgt_btns, text="Clear targets",
                    command=lambda: self.targets_text.delete("1.0", "end")
