@@ -1,0 +1,30 @@
+# ---- Python ----
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# ---- PyInstaller build artifacts ----
+build/
+# We intentionally KEEP the built exe (see !dist/NetworkDiagrammer.exe below),
+# but ignore everything else PyInstaller drops into dist/.
+dist/*
+!dist/NetworkDiagrammer.exe
+
+# ---- Third-party installers (do NOT redistribute) ----
+nmap-*-setup.exe
+*.msi
+
+# ---- App runtime output / user settings ----
+diagrammer_config.json
+auto_network_map.html
+*.html
+# keep any docs/ html if you add it later:
+!docs/**/*.html
+
+# ---- OS / editor cruft ----
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
