@@ -283,6 +283,7 @@ class AutoNetworkDiagrammer:
         """)
         self.router_ip = None
         self.device_count = 0
+        self.unconfirmed_count = 0
         self.local_ip = _primary_ip()
         self.traces = {}              # host -> [{"ttl","ip","host","rtt"}, ...] from <trace>
         self.arp_table = {}           # ip -> mac, read from the OS ARP cache
@@ -313,6 +314,41 @@ class AutoNetworkDiagrammer:
         filled = int(width * pct / 100)
         return "[" + "#" * filled + "-" * (width - filled) + "]"
 
+    @staticmethod
+    def _network_broadcast_ips(target):
+        """The network/broadcast addresses of a CIDR target, if it is one.
+
+        These never correspond to a real device, but some routers still
+        answer discovery probes for them, so we exclude them outright rather
+        than relying on the hostname/MAC heuristic. Returns an empty set for
+        single-host targets (where network == broadcast == the host itself)
+        or targets that aren't a plain CIDR (ranges, comma lists, etc).
+        """
+        try:
+            net = ipaddress.ip_network(target, strict=False)
+        except ValueError:
+            return set()
+        if net.num_addresses <= 2:
+            return set()
+        return {str(net.network_address), str(net.broadcast_address)}
+
+    @staticmethod
+    def _is_real_unicast_mac(mac):
+        """False for missing/placeholder MACs and broadcast/multicast ones.
+
+        A broadcast (ff:ff:ff:ff:ff:ff) or multicast (multicast bit set in
+        the first octet, e.g. 01:00:5e:...) MAC in the ARP table means
+        something answered on behalf of the address, not that a real NIC
+        lives there — it shouldn't count as evidence of a real device.
+        """
+        if not mac or mac == 'Unknown':
+            return False
+        try:
+            first_octet = int(mac.replace('-', ':').split(':')[0], 16)
+        except (ValueError, IndexError):
+            return False
+        return not (first_octet & 0x01)
+
     def scan_network(self, targets):
         self.log("\U0001F50D Scanning...")
         self.run_start_ts = time.time()
@@ -324,17 +360,34 @@ class AutoNetworkDiagrammer:
             if not target:
                 continue
             self.log(f"  → {target}")
+            skip_ips = self._network_broadcast_ips(target)
             try:
                 if not self._run_nmap(target, arguments=self.NMAP_DISCOVERY_ARGS):
                     self.log("⏹ Stopped by user.")
                     break
                 self._refresh_arp_table()
                 for host in self.scanner.all_hosts():
+                    if host in skip_ips:
+                        continue
+
                     hostname = self.scanner[host].hostname() or self._resolve_hostname(host)
-                    hostname = hostname or f"host-{host.split('.')[-1]}"
                     mac = self.scanner[host]['addresses'].get('mac')
-                    if not mac or mac == 'Unknown':
+                    if not self._is_real_unicast_mac(mac):
                         mac = self.arp_table.get(host, 'Unknown')
+                    if not self._is_real_unicast_mac(mac):
+                        mac = 'Unknown'
+
+                    # Some routers/firewalls answer discovery probes (SYN/ACK,
+                    # ICMP) for IPs nothing is actually using — nmap reports
+                    # these as "up" with no way to tell them apart from a real
+                    # device unless we have a hostname or a MAC (i.e. an actual
+                    # ARP reply). Without either, skip it rather than invent a
+                    # fake "host-xx" node for an address nothing is assigned to.
+                    if not hostname and mac == 'Unknown':
+                        self.unconfirmed_count += 1
+                        continue
+
+                    hostname = hostname or f"host-{host.split('.')[-1]}"
                     device_type = self.guess_device_type(hostname, host)
 
                     reason = self.scanner[host].get('status', {}).get('reason', '')
@@ -360,9 +413,12 @@ class AutoNetworkDiagrammer:
             except Exception as e:
                 self.log(f"     ⚠️ Error on {target}: {e}")
         elapsed = self._fmt_elapsed(time.time() - self.run_start_ts)
-        self.log(f"Found {self.device_count} device(s) in {elapsed}.")
+        summary = f"Found {self.device_count} device(s) in {elapsed}."
+        if self.unconfirmed_count:
+            summary += f" ({self.unconfirmed_count} unconfirmed IP(s) skipped — no hostname/MAC.)"
+        self.log(summary)
 
-    def _resolve_hostname(self, ip, timeout=0.5):
+    def _resolve_hostname(self, ip, timeout=1.5):
         """Fallback reverse-DNS lookup for hosts nmap's own -R couldn't name.
 
         socket.gethostbyaddr() has no built-in timeout and can block for the

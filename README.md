@@ -22,7 +22,8 @@ The exe is unsigned and self-built, so Windows SmartScreen may warn about an unk
 
 - **Auto-detects your network** on launch — nothing to configure to get started.
 - **Editable targets** — scan any subnet (`192.168.1.0/24`) or single host (`10.0.0.5`), one per line.
-- **Deeper host discovery** — combines ARP, ICMP echo/timestamp, and TCP SYN/ACK probes so devices that drop plain ICMP still get found, with reverse-DNS + OS-resolver hostname lookups (and a Python-side fallback) for accurate IP/hostname pairs.
+- **Deeper host discovery** — combines ARP, ICMP echo/timestamp, and TCP SYN/ACK probes so devices that drop plain ICMP still get found, with reverse-DNS + a bounded socket-resolver fallback for accurate IP/hostname pairs.
+- **Filters out phantom hosts** — some routers/firewalls answer discovery probes for IPs nothing is actually using; an address only becomes a node if it has a real hostname or an ARP-confirmed unicast MAC, and the subnet's network/broadcast addresses are always excluded.
 - **Real edge topology** — traces the actual hop-by-hop path to every device (`nmap --traceroute`) and cross-references the OS ARP cache to confirm which devices sit on your local L2 segment, instead of just guessing a star around the router. A star-around-the-router guess is only used as a last resort for devices with no traceroute/ARP evidence.
 - **Live progress meter and per-device timer** in the scan log — a running `[mm:ss]` elapsed stamp on every device found, plus a real percent-complete/ETA readout parsed straight from nmap's own progress stream.
 - **Runs in the background** so the window stays responsive, with no nmap console window flashing on top of it.
