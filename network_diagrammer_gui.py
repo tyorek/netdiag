@@ -60,6 +60,32 @@ _NO_WINDOW = {"creationflags": subprocess.CREATE_NO_WINDOW} if os.name == "nt" e
 _TASKPROGRESS_RE = re.compile(rb'<taskprogress\s+([^>]*)/>')
 _XML_ATTR_RE = re.compile(rb'(\w+)="([^"]*)"')
 
+# GUI color palettes for light/dark mode (see DiagrammerApp._apply_theme).
+THEMES = {
+    "light": dict(
+        bg="#f0f0f0", fg="#000000",
+        entry_bg="#ffffff", entry_fg="#000000",
+        tree_bg="#ffffff", tree_fg="#000000",
+        heading_bg="#e1e1e1", heading_fg="#000000",
+        select_bg="#0078d7", select_fg="#ffffff",
+        log_bg="#ffffff", log_fg="#000000", log_insert="#000000",
+        button_bg="#e1e1e1", button_fg="#000000",
+        progress_trough="#e1e1e1", progress_bar="#06b025",
+        muted_fg="#666666",
+    ),
+    "dark": dict(
+        bg="#1e1e1e", fg="#e6e6e6",
+        entry_bg="#2d2d2d", entry_fg="#e6e6e6",
+        tree_bg="#252525", tree_fg="#e6e6e6",
+        heading_bg="#333333", heading_fg="#e6e6e6",
+        select_bg="#3a6ea5", select_fg="#ffffff",
+        log_bg="#1a1a1a", log_fg="#d4d4d4", log_insert="#ffffff",
+        button_bg="#3c3c3c", button_fg="#e6e6e6",
+        progress_trough="#333333", progress_bar="#3a9d4f",
+        muted_fg="#a0a0a0",
+    ),
+}
+
 
 # --------------------------------------------------------------------------- #
 #  Scan history (SQLite)                                                       #
@@ -262,25 +288,35 @@ def detect_default_gateway():
 #  Core scanning / diagram logic                                              #
 # --------------------------------------------------------------------------- #
 class AutoNetworkDiagrammer:
-    def __init__(self, log=print, gateway_hint=None, stop_event=None, progress=None):
+    def __init__(self, log=print, gateway_hint=None, stop_event=None, progress=None,
+                 dark_mode=False):
         self.log = log
         self.progress_cb = progress or (lambda pct: None)   # optional live % callback
         self.gateway_hint = gateway_hint      # optional detected gateway IP
         self.stop_event = stop_event or threading.Event()
         self.run_start_ts = None
+        self.dark_mode = dark_mode
         self._proc_lock = threading.Lock()
         self._current_proc = None
         self.scanner = nmap.PortScanner()
         self.G = nx.Graph()
+
+        if dark_mode:
+            bgcolor, font_color = "#1e1e1e", "#e6e6e6"
+            edge_color, edge_font_color = "#8a8a8a", "#cfcfcf"
+        else:
+            bgcolor, font_color = "#ffffff", False
+            edge_color, edge_font_color = "#848484", "#343434"
         self.net = Network(height="1000px", width="100%",
-                           directed=False, notebook=False)
-        self.net.set_options("""
-        {
+                           directed=False, notebook=False,
+                           bgcolor=bgcolor, font_color=font_color)
+        self.net.set_options(json.dumps({
             "nodes": {"shape": "dot", "size": 28, "font": {"size": 15}},
-            "edges": {"smooth": {"type": "dynamic"}, "font": {"size": 10}},
+            "edges": {"smooth": {"type": "dynamic"},
+                      "font": {"size": 10, "color": edge_font_color},
+                      "color": edge_color},
             "physics": {"stabilization": {"iterations": 2000}}
-        }
-        """)
+        }))
         self.router_ip = None
         self.device_count = 0
         self.unconfirmed_count = 0
@@ -710,8 +746,34 @@ class AutoNetworkDiagrammer:
         self.add_topology_edges()
         self.net.from_nx(self.G)
         self.net.write_html(output_file)
+        if self.dark_mode:
+            self._darken_page_chrome(output_file)
         self.log(f"✅ Diagram saved: {output_file}")
         return output_file
+
+    @staticmethod
+    def _darken_page_chrome(output_file):
+        """pyvis's bgcolor only themes the graph canvas (#mynetwork); the
+        surrounding Bootstrap page/card chrome stays white. Inject an
+        override stylesheet so the whole page matches dark mode.
+        """
+        dark_css = (
+            "<style>"
+            "body{background-color:#1e1e1e!important;color:#e6e6e6!important;}"
+            ".card,.card-header,.card-body{background-color:#1e1e1e!important;"
+            "border-color:#3a3a3a!important;color:#e6e6e6!important;}"
+            "#mynetwork{border:1px solid #3a3a3a!important;}"
+            "h1,h2,h3{color:#e6e6e6!important;}"
+            "</style>"
+        )
+        try:
+            with open(output_file, "r", encoding="utf-8") as f:
+                html = f.read()
+            html = html.replace("</head>", dark_css + "</head>")
+            with open(output_file, "w", encoding="utf-8") as f:
+                f.write(html)
+        except OSError:
+            pass
 
 
 # --------------------------------------------------------------------------- #
@@ -733,6 +795,7 @@ class DiagrammerApp(tk.Tk):
         self.stopping = False
         self.history = ScanHistory()
         self.current_scan_id = None
+        self.dark_mode_var = tk.BooleanVar(value=False)
 
         self._build_ui()
         self.after(100, self._drain_log_queue)
@@ -744,12 +807,18 @@ class DiagrammerApp(tk.Tk):
     def _build_ui(self):
         pad = {"padx": 10, "pady": 6}
 
-        ttk.Label(self, text="Auto Network Diagrammer",
-                  font=("Segoe UI", 16, "bold")).pack(anchor="w", **pad)
-        ttk.Label(
+        title_frame = ttk.Frame(self)
+        title_frame.pack(fill="x", **pad)
+        ttk.Label(title_frame, text="Auto Network Diagrammer",
+                  font=("Segoe UI", 16, "bold")).pack(side="left")
+        ttk.Checkbutton(title_frame, text="\U0001F319 Dark Mode",
+                        variable=self.dark_mode_var,
+                        command=self._toggle_dark_mode).pack(side="right")
+
+        self.subtitle_label = ttk.Label(
             self,
-            text="Enter the networks to scan (one per line), or auto-detect yours.",
-            foreground="#555").pack(anchor="w", padx=10)
+            text="Enter the networks to scan (one per line), or auto-detect yours.")
+        self.subtitle_label.pack(anchor="w", padx=10)
 
         # Targets
         tgt_frame = ttk.LabelFrame(self, text="Targets  (e.g. 192.168.1.0/24  or  10.0.0.5)")
@@ -765,7 +834,7 @@ class DiagrammerApp(tk.Tk):
         ttk.Button(tgt_btns, text="Clear targets",
                    command=lambda: self.targets_text.delete("1.0", "end")
                    ).pack(side="left", padx=6)
-        self.gw_label = ttk.Label(tgt_btns, text="", foreground="#777")
+        self.gw_label = ttk.Label(tgt_btns, text="")
         self.gw_label.pack(side="left", padx=6)
 
         # Scan name row
@@ -841,13 +910,62 @@ class DiagrammerApp(tk.Tk):
         self.log_widget.pack(fill="both", expand=True, padx=6, pady=6)
 
         self.status = tk.StringVar(value="Ready.")
-        ttk.Label(self, textvariable=self.status,
-                  relief="sunken", anchor="w").pack(fill="x", side="bottom")
+        self.status_label = ttk.Label(self, textvariable=self.status,
+                                      relief="sunken", anchor="w")
+        self.status_label.pack(fill="x", side="bottom")
+
+    # ---- theming ----------------------------------------------------------#
+    def _toggle_dark_mode(self):
+        self._apply_theme(self.dark_mode_var.get())
+        self._save_config()
+
+    def _apply_theme(self, dark):
+        theme = THEMES["dark"] if dark else THEMES["light"]
+
+        self.configure(bg=theme["bg"])
+
+        style = ttk.Style(self)
+        style.theme_use("clam")
+        style.configure(".", background=theme["bg"], foreground=theme["fg"],
+                        fieldbackground=theme["entry_bg"])
+        style.configure("TFrame", background=theme["bg"])
+        style.configure("TLabel", background=theme["bg"], foreground=theme["fg"])
+        style.configure("TLabelframe", background=theme["bg"], foreground=theme["fg"])
+        style.configure("TLabelframe.Label", background=theme["bg"], foreground=theme["fg"])
+        style.configure("TCheckbutton", background=theme["bg"], foreground=theme["fg"])
+        style.configure("TButton", background=theme["button_bg"], foreground=theme["button_fg"])
+        style.map("TButton",
+                  background=[("active", theme["select_bg"]), ("disabled", theme["bg"])],
+                  foreground=[("active", theme["select_fg"])])
+        style.configure("TEntry", fieldbackground=theme["entry_bg"],
+                        foreground=theme["entry_fg"], insertcolor=theme["entry_fg"])
+        style.configure("TProgressbar", background=theme["progress_bar"],
+                        troughcolor=theme["progress_trough"])
+        style.configure("Treeview", background=theme["tree_bg"], fieldbackground=theme["tree_bg"],
+                        foreground=theme["tree_fg"])
+        style.map("Treeview",
+                  background=[("selected", theme["select_bg"])],
+                  foreground=[("selected", theme["select_fg"])])
+        style.configure("Treeview.Heading", background=theme["heading_bg"],
+                        foreground=theme["heading_fg"])
+
+        # Plain tk widgets ttk styling doesn't reach.
+        self.targets_text.configure(
+            bg=theme["entry_bg"], fg=theme["entry_fg"], insertbackground=theme["entry_fg"],
+            selectbackground=theme["select_bg"], selectforeground=theme["select_fg"])
+        self.log_widget.configure(
+            bg=theme["log_bg"], fg=theme["log_fg"], insertbackground=theme["log_insert"],
+            selectbackground=theme["select_bg"], selectforeground=theme["select_fg"])
+
+        # Labels with a deliberately muted (not full-strength) foreground.
+        self.subtitle_label.configure(foreground=theme["muted_fg"])
+        self.gw_label.configure(foreground=theme["muted_fg"])
 
     # ---- config persistence --------------------------------------------- #
     def _load_config_or_detect(self):
         """Load last-used targets; if none saved, auto-detect the network."""
         loaded = False
+        dark = False
         try:
             if os.path.exists(CONFIG_PATH):
                 with open(CONFIG_PATH, "r", encoding="utf-8") as f:
@@ -858,8 +976,12 @@ class DiagrammerApp(tk.Tk):
                     loaded = True
                 if cfg.get("output"):
                     self.out_var.set(cfg["output"])
+                dark = bool(cfg.get("dark_mode", False))
         except Exception:
             pass
+
+        self.dark_mode_var.set(dark)
+        self._apply_theme(dark)
 
         if not loaded:
             self._detect_network()
@@ -872,7 +994,8 @@ class DiagrammerApp(tk.Tk):
                        if t.strip()]
             with open(CONFIG_PATH, "w", encoding="utf-8") as f:
                 json.dump({"targets": targets,
-                           "output": self.out_var.get()}, f, indent=2)
+                           "output": self.out_var.get(),
+                           "dark_mode": self.dark_mode_var.get()}, f, indent=2)
         except Exception:
             pass
 
@@ -967,7 +1090,7 @@ class DiagrammerApp(tk.Tk):
         self._log(f"--- Run started {datetime.now():%Y-%m-%d %H:%M:%S} ---")
 
         self.worker = threading.Thread(
-            target=self._run_scan, args=(targets, out), daemon=True)
+            target=self._run_scan, args=(targets, out, self.dark_mode_var.get()), daemon=True)
         self.worker.start()
 
     def _stop_scan(self):
@@ -977,11 +1100,12 @@ class DiagrammerApp(tk.Tk):
             self.status.set("Stopping…")
             self.diag.stop()
 
-    def _run_scan(self, targets, out):
+    def _run_scan(self, targets, out, dark_mode):
         try:
             self.diag = AutoNetworkDiagrammer(log=self._log,
                                               gateway_hint=self.detected_gateway,
-                                              progress=self._progress)
+                                              progress=self._progress,
+                                              dark_mode=dark_mode)
             self.diag.scan_network(targets)
             path = self.diag.generate(out)
             self.output_file = os.path.abspath(path)

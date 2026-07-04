@@ -29,6 +29,7 @@ The exe is unsigned and self-built, so Windows SmartScreen may warn about an unk
 - **Runs in the background** so the window stays responsive, with no nmap console window flashing on top of it.
 - **Each scan gets its own output file** — `scan_1.html`, `scan_2.html`, and so on, so past diagrams are never overwritten by the next run.
 - **Auto-highlights the just-finished scan** in the Previous Scans list.
+- **Dark mode** — toggle with the 🌙 button in the top-right; themes both the app window and the generated diagram, and is remembered between runs.
 - **Device-type coloring** for routers, switches, servers, NAS, DNS, APs, printers, cameras, phones, and workstations.
 - **Remembers your last targets** between runs.
 - **Interactive output** — pan/zoom/drag the generated HTML map.
