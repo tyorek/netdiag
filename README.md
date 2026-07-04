@@ -1,6 +1,6 @@
 # Auto Network Diagrammer
 
-A clickable desktop app that scans one or more IP networks with **nmap**, infers a star topology around the detected router/gateway, and renders an interactive HTML map using **pyvis**. No networks are hardcoded — it auto-detects the subnet your machine is on, and you can add or edit targets freely.
+A clickable desktop app that scans one or more IP networks with **nmap**, maps real edge topology from **traceroute** hops and **ARP** cache data, and renders an interactive HTML map using **pyvis**. No networks are hardcoded — it auto-detects the subnet your machine is on, and you can add or edit targets freely.
 
 ![status](https://img.shields.io/badge/status-working-brightgreen)
 ![python](https://img.shields.io/badge/python-3.9%2B-blue)
@@ -22,8 +22,9 @@ The exe is unsigned and self-built, so Windows SmartScreen may warn about an unk
 
 - **Auto-detects your network** on launch — nothing to configure to get started.
 - **Editable targets** — scan any subnet (`192.168.1.0/24`) or single host (`10.0.0.5`), one per line.
+- **Deeper host discovery** — combines ARP, ICMP echo/timestamp, and TCP SYN/ACK probes so devices that drop plain ICMP still get found, with reverse-DNS + OS-resolver hostname lookups (and a Python-side fallback) for accurate IP/hostname pairs.
+- **Real edge topology** — traces the actual hop-by-hop path to every device (`nmap --traceroute`) and cross-references the OS ARP cache to confirm which devices sit on your local L2 segment, instead of just guessing a star around the router. A star-around-the-router guess is only used as a last resort for devices with no traceroute/ARP evidence.
 - **Runs in the background** so the window stays responsive, with a live scan log.
-- **Infers topology** by connecting devices to the detected router/gateway.
 - **Device-type coloring** for routers, switches, servers, NAS, DNS, APs, printers, cameras, phones, and workstations.
 - **Remembers your last targets** between runs.
 - **Interactive output** — pan/zoom/drag the generated `auto_network_map.html`.
@@ -50,13 +51,14 @@ Enter (or auto-detect) the networks to scan, click Scan & Generate, then Open Di
 
 ## How it works
 
-- `nmap -sn -R` host discovery across each target range.
+- Host discovery across each target range using ARP ping, ICMP echo/timestamp, and TCP SYN/ACK probes (`nmap -sn -PR -PE -PP -PS... -PA... -R --system-dns`), with a Python `socket.gethostbyaddr` fallback for any host nmap can't name.
+- `--traceroute` is enabled on every scan; since the `python-nmap` wrapper discards `<trace>` data, the raw nmap XML is parsed directly to recover the real hop-by-hop path to each host.
+- The OS ARP cache (`arp -a` / `ip neigh`) is read after each scan pass to fill in MACs nmap can't reach without raw-socket privileges, and to confirm which hosts are directly on your local L2 segment.
 - Each host becomes a node, typed and colored by hostname/IP heuristics.
-- A router is chosen by name, then detected gateway, then a `.1` fallback.
-- All other devices are linked to it (an inferred star topology).
+- Edges are built in priority order: real traceroute hop chains first (adding intermediate routers you didn't scan directly), then ARP-confirmed direct links, and only as a last resort — for devices with neither signal — an inferred link to the detected/guessed router.
 - pyvis writes a self-contained interactive HTML map.
 
-Edges are inferred, not traced from switch/ARP tables — this is a quick visual approximation, not an authoritative Layer-2 map.
+> Traceroute and ARP-based host discovery need raw-socket access — run the app as Administrator (Windows) / root (Linux/macOS) for the fullest, most accurate topology. Without elevated privileges, nmap falls back to what it can do unprivileged and more devices will land on the inferred-star fallback.
 
 ## License
 

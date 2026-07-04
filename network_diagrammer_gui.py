@@ -21,6 +21,7 @@ Run:
 """
 
 import os
+import re
 import json
 import shlex
 import socket
@@ -30,6 +31,7 @@ import subprocess
 import queue
 import threading
 import webbrowser
+import xml.etree.ElementTree as ET
 from datetime import datetime
 
 import tkinter as tk
@@ -269,6 +271,19 @@ class AutoNetworkDiagrammer:
         """)
         self.router_ip = None
         self.device_count = 0
+        self.local_ip = _primary_ip()
+        self.traces = {}              # host -> [{"ttl","ip","host","rtt"}, ...] from <trace>
+        self.arp_table = {}           # ip -> mac, read from the OS ARP cache
+        self.local_segment_ips = set()  # ips confirmed on our local L2 segment (ARP)
+
+    # Discovery probes across several protocols/ports so hosts that drop plain
+    # ICMP (common on Windows/firewalled devices) still get found, plus -R/
+    # --system-dns to resolve real hostnames and --traceroute to map real hops.
+    NMAP_DISCOVERY_ARGS = (
+        "-sn -PR -PE -PP "
+        "-PS21,22,23,25,80,443,3389,8080 -PA21,22,80,443,3389 "
+        "--traceroute -R --system-dns --max-retries 2"
+    )
 
     def scan_network(self, targets):
         self.log("\U0001F50D Scanning...")
@@ -281,13 +296,21 @@ class AutoNetworkDiagrammer:
                 continue
             self.log(f"  → {target}")
             try:
-                if not self._run_nmap(target, arguments='-sn -R'):
+                if not self._run_nmap(target, arguments=self.NMAP_DISCOVERY_ARGS):
                     self.log("⏹ Stopped by user.")
                     break
+                self._refresh_arp_table()
                 for host in self.scanner.all_hosts():
-                    hostname = self.scanner[host].hostname() or f"host-{host.split('.')[-1]}"
-                    mac = self.scanner[host]['addresses'].get('mac', 'Unknown')
+                    hostname = self.scanner[host].hostname() or self._resolve_hostname(host)
+                    hostname = hostname or f"host-{host.split('.')[-1]}"
+                    mac = self.scanner[host]['addresses'].get('mac')
+                    if not mac or mac == 'Unknown':
+                        mac = self.arp_table.get(host, 'Unknown')
                     device_type = self.guess_device_type(hostname, host)
+
+                    reason = self.scanner[host].get('status', {}).get('reason', '')
+                    if 'arp' in reason:
+                        self.local_segment_ips.add(host)
 
                     if self.router_ip is None and any(
                         x in hostname.lower()
@@ -307,6 +330,84 @@ class AutoNetworkDiagrammer:
             except Exception as e:
                 self.log(f"     ⚠️ Error on {target}: {e}")
         self.log(f"Found {self.device_count} device(s).")
+
+    def _resolve_hostname(self, ip):
+        """Fallback reverse-DNS lookup for hosts nmap couldn't name."""
+        try:
+            return socket.gethostbyaddr(ip)[0]
+        except Exception:
+            return ""
+
+    def _refresh_arp_table(self):
+        """Read the OS ARP cache (arp -a / ip neigh) so we get MACs nmap can't
+        reach without raw-packet privileges, and can confirm which hosts sit
+        on our own local L2 segment (directly reachable, no routing hop).
+        """
+        table = {}
+        try:
+            if os.name == "nt":
+                out = subprocess.check_output(["arp", "-a"], text=True, errors="ignore")
+                for line in out.splitlines():
+                    parts = line.split()
+                    if (len(parts) >= 2 and parts[0].count(".") == 3
+                            and re.match(r'^[0-9a-fA-F]{2}([-:][0-9a-fA-F]{2}){5}$', parts[1])):
+                        table[parts[0]] = parts[1].replace('-', ':').lower()
+            else:
+                try:
+                    out = subprocess.check_output(
+                        ["ip", "neigh", "show"], text=True, errors="ignore")
+                    for line in out.splitlines():
+                        parts = line.split()
+                        if parts and parts[0].count(".") == 3 and "lladdr" in parts:
+                            table[parts[0]] = parts[parts.index("lladdr") + 1].lower()
+                except Exception:
+                    out = subprocess.check_output(["arp", "-n"], text=True, errors="ignore")
+                    for line in out.splitlines():
+                        parts = line.split()
+                        if (len(parts) >= 3 and parts[0].count(".") == 3
+                                and re.match(r'^[0-9a-fA-F]{2}(:[0-9a-fA-F]{2}){5}$', parts[2])):
+                            table[parts[0]] = parts[2].lower()
+        except Exception:
+            pass
+        if table:
+            self.arp_table.update(table)
+            self.local_segment_ips.update(table.keys())
+
+    def _parse_traceroute_xml(self, xml_bytes):
+        """Pull <trace> hop chains out of the raw nmap XML.
+
+        python-nmap's analyse_nmap_xml_scan() discards <trace> entirely, so we
+        parse the same XML ourselves to get the real hop-by-hop path to each host.
+        """
+        if not xml_bytes:
+            return
+        try:
+            root = ET.fromstring(xml_bytes)
+        except ET.ParseError:
+            return
+        for dhost in root.findall("host"):
+            addr_el = dhost.find("address[@addrtype='ipv4']")
+            if addr_el is None:
+                continue
+            host_ip = addr_el.get("addr")
+            trace_el = dhost.find("trace")
+            if trace_el is None:
+                continue
+            hops = []
+            for hop in trace_el.findall("hop"):
+                try:
+                    ttl = int(hop.get("ttl", 0))
+                except ValueError:
+                    ttl = 0
+                hops.append({
+                    "ttl": ttl,
+                    "ip": hop.get("ipaddr"),
+                    "host": hop.get("host") or "",
+                    "rtt": hop.get("rtt", "?"),
+                })
+            if hops:
+                hops.sort(key=lambda h: h["ttl"])
+                self.traces[host_ip] = hops
 
     def _run_nmap(self, target, arguments):
         """Run nmap for one target as a killable subprocess.
@@ -337,6 +438,7 @@ class AutoNetworkDiagrammer:
 
         self.scanner.analyse_nmap_xml_scan(
             nmap_xml_output=out, nmap_err=err.decode(errors="ignore"))
+        self._parse_traceroute_xml(out)
         return True
 
     def stop(self):
@@ -349,28 +451,88 @@ class AutoNetworkDiagrammer:
                 except Exception:
                     pass
 
-    def add_inferred_edges(self):
-        # Router priority: name-detected -> detected gateway -> a ".1" host.
-        if not self.router_ip and self.gateway_hint and self.gateway_hint in self.G:
-            self.router_ip = self.gateway_hint
-            self.log(f"Using detected gateway as router: {self.router_ip}")
+    def add_topology_edges(self):
+        """Build real edges from traceroute hop chains and ARP-confirmed local
+        links, instead of inferring a star around a guessed router.
 
-        if not self.router_ip:
-            self.log("⚠️ No router detected by name/gateway. Using fallback (.1 host).")
-            for node in list(self.G.nodes):
-                if node.endswith('.1'):
-                    self.router_ip = node
-                    break
+        For every host we got a traceroute for, we wire together the actual
+        hop-by-hop path from this machine to that host (adding any
+        intermediate routers we hadn't otherwise scanned). Hosts ARP confirmed
+        as being on our own L2 segment get a direct link. Only devices with
+        neither signal fall back to the old star-around-the-router guess.
+        """
+        local_node = self.local_ip or "scanner"
+        if local_node not in self.G:
+            label = f"This PC\n{local_node}"
+            title = f"Scanning host\nIP: {local_node}"
+            self.G.add_node(local_node, label=label, title=title, group="scanner")
+            self.net.add_node(local_node, label=label, title=title,
+                              color=self.get_color("scanner"))
 
-        if self.router_ip and self.router_ip in self.G:
-            self.log(f"\U0001F517 Connecting devices to router: {self.router_ip}")
-            for node in list(self.G.nodes):
-                if node != self.router_ip:
-                    self.G.add_edge(self.router_ip, node, label="inferred")
-                    self.net.add_edge(self.router_ip, node,
-                                      title="Inferred connection", label="→")
-        else:
-            self.log("⚠️ Could not find a central router for edge inference.")
+        seen_edges = set()
+        linked_nodes = {local_node}  # nodes that already have a real edge
+
+        def link(a, b, label, title):
+            if not a or not b or a == b:
+                return
+            key = frozenset((a, b))
+            if key in seen_edges:
+                return
+            seen_edges.add(key)
+            self.G.add_edge(a, b, label=label)
+            self.net.add_edge(a, b, label=label, title=title)
+            linked_nodes.add(a)
+            linked_nodes.add(b)
+
+        # 1) Real hop-by-hop paths from traceroute.
+        for host, hops in self.traces.items():
+            if host not in self.G:
+                continue
+            chain = [local_node]
+            for hop in hops:
+                hop_ip = hop["ip"]
+                if not hop_ip:
+                    continue
+                if hop_ip not in self.G:
+                    hop_label = hop["host"] or hop_ip
+                    label = f"{hop_label}\n{hop_ip}"
+                    title = f"IP: {hop_ip}\n(routing hop, not directly scanned)"
+                    self.G.add_node(hop_ip, label=label, title=title, group="router")
+                    self.net.add_node(hop_ip, label=label, title=title,
+                                      color=self.get_color("router"))
+                chain.append(hop_ip)
+            if chain[-1] != host:
+                chain.append(host)
+            for a, b in zip(chain, chain[1:]):
+                link(a, b, "traceroute", f"Hop toward {host}")
+            self.log(f"  \U0001F5FA traced route to {host}: {' -> '.join(chain)}")
+
+        # 2) ARP-confirmed direct neighbors (same L2 segment, no routing hop
+        # needed) for hosts traceroute didn't cover.
+        for node in list(self.G.nodes):
+            if node in linked_nodes:
+                continue
+            if node in self.local_segment_ips:
+                link(local_node, node, "arp-confirmed",
+                     "Directly connected (same L2 segment, ARP-confirmed)")
+
+        # 3) Last resort: star topology around the detected/guessed router,
+        # only for devices with neither traceroute nor ARP evidence.
+        untraced = [n for n in self.G.nodes if n not in linked_nodes]
+        if untraced:
+            if not self.router_ip and self.gateway_hint and self.gateway_hint in self.G:
+                self.router_ip = self.gateway_hint
+            if not self.router_ip:
+                for node in list(self.G.nodes):
+                    if node.endswith('.1'):
+                        self.router_ip = node
+                        break
+            anchor = self.router_ip if (self.router_ip and self.router_ip in self.G) else local_node
+            self.log(f"⚠️ No traceroute/ARP evidence for {len(untraced)} device(s); "
+                     f"inferring link to {anchor}.")
+            for node in untraced:
+                link(anchor, node, "inferred",
+                     "Inferred connection (no traceroute/ARP data)")
 
     def get_subnet(self, ip):
         """Label a host by the /24 block it sits in (display only)."""
@@ -399,12 +561,12 @@ class AutoNetworkDiagrammer:
             "router": "#e74c3c", "switch": "#3498db", "server": "#2ecc71",
             "nas": "#1abc9c", "dns": "#8e44ad", "ap": "#9b59b6",
             "printer": "#f39c12", "camera": "#e67e22", "phone": "#16a085",
-            "workstation": "#95a5a6"
+            "workstation": "#95a5a6", "scanner": "#34495e"
         }
         return colors.get(device_type, "#3498db")
 
     def generate(self, output_file="auto_network_map.html"):
-        self.add_inferred_edges()
+        self.add_topology_edges()
         self.net.from_nx(self.G)
         self.net.write_html(output_file)
         self.log(f"✅ Diagram saved: {output_file}")
