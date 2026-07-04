@@ -30,6 +30,7 @@ import ipaddress
 import subprocess
 import queue
 import threading
+import time
 import webbrowser
 import xml.etree.ElementTree as ET
 from datetime import datetime
@@ -49,6 +50,15 @@ CONFIG_PATH = os.path.join(
 # SQLite file tracking every past scan (name, targets, result, status).
 HISTORY_DB_PATH = os.path.join(
     os.path.dirname(os.path.abspath(__file__)), "scan_history.db")
+
+# Stops nmap/ipconfig/arp etc. from flashing their own console window when
+# this app is run as a windowed (console-less) build on Windows.
+_NO_WINDOW = {"creationflags": subprocess.CREATE_NO_WINDOW} if os.name == "nt" else {}
+
+# Parses nmap's live "-v --stats-every" progress tags out of its XML stream,
+# e.g. <taskprogress task="ARP Ping Scan" time="..." percent="76.67" remaining="1" etc="..."/>
+_TASKPROGRESS_RE = re.compile(rb'<taskprogress\s+([^>]*)/>')
+_XML_ATTR_RE = re.compile(rb'(\w+)="([^"]*)"')
 
 
 # --------------------------------------------------------------------------- #
@@ -150,7 +160,7 @@ def _detect_ip_mask_pairs():
         if os.name == "nt":
             # Parse `ipconfig`: pair each "IPv4 Address" with the following
             # "Subnet Mask" line within the same adapter block.
-            out = subprocess.check_output(["ipconfig"], text=True, errors="ignore")
+            out = subprocess.check_output(["ipconfig"], text=True, errors="ignore", **_NO_WINDOW)
             pending_ip = None
             for line in out.splitlines():
                 low = line.lower()
@@ -167,7 +177,7 @@ def _detect_ip_mask_pairs():
             try:
                 out = subprocess.check_output(
                     ["ip", "-o", "-f", "inet", "addr", "show"],
-                    text=True, errors="ignore")
+                    text=True, errors="ignore", **_NO_WINDOW)
                 for line in out.splitlines():
                     toks = line.split()
                     if "inet" in toks:
@@ -177,7 +187,7 @@ def _detect_ip_mask_pairs():
                             pairs.append((ip, int(prefix)))
             except Exception:
                 # macOS / BSD: "inet 192.168.5.10 netmask 0xfffffff0"
-                out = subprocess.check_output(["ifconfig"], text=True, errors="ignore")
+                out = subprocess.check_output(["ifconfig"], text=True, errors="ignore", **_NO_WINDOW)
                 for line in out.splitlines():
                     toks = line.split()
                     if "inet" in toks and "netmask" in toks:
@@ -229,7 +239,7 @@ def detect_default_gateway():
     try:
         if os.name == "nt":
             out = subprocess.check_output(
-                ["ipconfig"], text=True, errors="ignore")
+                ["ipconfig"], text=True, errors="ignore", **_NO_WINDOW)
             for line in out.splitlines():
                 if "Default Gateway" in line and ":" in line:
                     ip = line.split(":")[-1].strip()
@@ -237,7 +247,7 @@ def detect_default_gateway():
                         return ip
         else:
             out = subprocess.check_output(
-                ["ip", "route"], text=True, errors="ignore")
+                ["ip", "route"], text=True, errors="ignore", **_NO_WINDOW)
             for line in out.splitlines():
                 if line.startswith("default"):
                     parts = line.split()
@@ -252,10 +262,12 @@ def detect_default_gateway():
 #  Core scanning / diagram logic                                              #
 # --------------------------------------------------------------------------- #
 class AutoNetworkDiagrammer:
-    def __init__(self, log=print, gateway_hint=None, stop_event=None):
+    def __init__(self, log=print, gateway_hint=None, stop_event=None, progress=None):
         self.log = log
+        self.progress_cb = progress or (lambda pct: None)   # optional live % callback
         self.gateway_hint = gateway_hint      # optional detected gateway IP
         self.stop_event = stop_event or threading.Event()
+        self.run_start_ts = None
         self._proc_lock = threading.Lock()
         self._current_proc = None
         self.scanner = nmap.PortScanner()
@@ -277,16 +289,33 @@ class AutoNetworkDiagrammer:
         self.local_segment_ips = set()  # ips confirmed on our local L2 segment (ARP)
 
     # Discovery probes across several protocols/ports so hosts that drop plain
-    # ICMP (common on Windows/firewalled devices) still get found, plus -R/
-    # --system-dns to resolve real hostnames and --traceroute to map real hops.
+    # ICMP (common on Windows/firewalled devices) still get found, plus -R to
+    # resolve real hostnames and --traceroute to map real hops.
+    #
+    # NOTE: deliberately NOT using --system-dns — it defers to the OS's
+    # synchronous resolver, which is dramatically slower than nmap's own
+    # async resolver for hosts with no PTR record (measured ~17x slower,
+    # 79s vs 4.6s, on a 16-address /28 with several unnamed hosts).
     NMAP_DISCOVERY_ARGS = (
         "-sn -PR -PE -PP "
         "-PS21,22,23,25,80,443,3389,8080 -PA21,22,80,443,3389 "
-        "--traceroute -R --system-dns --max-retries 2"
+        "--traceroute -R --max-retries 2"
     )
+
+    @staticmethod
+    def _fmt_elapsed(seconds):
+        m, s = divmod(max(0, int(seconds)), 60)
+        return f"{m:02d}:{s:02d}"
+
+    @staticmethod
+    def _ascii_bar(pct, width=20):
+        pct = max(0.0, min(100.0, pct))
+        filled = int(width * pct / 100)
+        return "[" + "#" * filled + "-" * (width - filled) + "]"
 
     def scan_network(self, targets):
         self.log("\U0001F50D Scanning...")
+        self.run_start_ts = time.time()
         for target in targets:
             if self.stop_event.is_set():
                 self.log("⏹ Stopped by user.")
@@ -326,17 +355,33 @@ class AutoNetworkDiagrammer:
                     self.net.add_node(host, label=label, title=title,
                                       color=self.get_color(device_type))
                     self.device_count += 1
-                    self.log(f"     ✓ {hostname} ({host})")
+                    elapsed = self._fmt_elapsed(time.time() - self.run_start_ts)
+                    self.log(f"     ✓ [{elapsed}] {hostname} ({host})")
             except Exception as e:
                 self.log(f"     ⚠️ Error on {target}: {e}")
-        self.log(f"Found {self.device_count} device(s).")
+        elapsed = self._fmt_elapsed(time.time() - self.run_start_ts)
+        self.log(f"Found {self.device_count} device(s) in {elapsed}.")
 
-    def _resolve_hostname(self, ip):
-        """Fallback reverse-DNS lookup for hosts nmap couldn't name."""
-        try:
-            return socket.gethostbyaddr(ip)[0]
-        except Exception:
-            return ""
+    def _resolve_hostname(self, ip, timeout=0.5):
+        """Fallback reverse-DNS lookup for hosts nmap's own -R couldn't name.
+
+        socket.gethostbyaddr() has no built-in timeout and can block for the
+        OS resolver's full retry cycle (measured 5-10+ seconds) on addresses
+        with no PTR record — with several such hosts on one subnet that adds
+        up fast, so this bounds the wait in a daemon thread instead.
+        """
+        result = [None]
+
+        def _lookup():
+            try:
+                result[0] = socket.gethostbyaddr(ip)[0]
+            except Exception:
+                pass
+
+        t = threading.Thread(target=_lookup, daemon=True)
+        t.start()
+        t.join(timeout)
+        return result[0] or ""
 
     def _refresh_arp_table(self):
         """Read the OS ARP cache (arp -a / ip neigh) so we get MACs nmap can't
@@ -346,7 +391,7 @@ class AutoNetworkDiagrammer:
         table = {}
         try:
             if os.name == "nt":
-                out = subprocess.check_output(["arp", "-a"], text=True, errors="ignore")
+                out = subprocess.check_output(["arp", "-a"], text=True, errors="ignore", **_NO_WINDOW)
                 for line in out.splitlines():
                     parts = line.split()
                     if (len(parts) >= 2 and parts[0].count(".") == 3
@@ -355,13 +400,13 @@ class AutoNetworkDiagrammer:
             else:
                 try:
                     out = subprocess.check_output(
-                        ["ip", "neigh", "show"], text=True, errors="ignore")
+                        ["ip", "neigh", "show"], text=True, errors="ignore", **_NO_WINDOW)
                     for line in out.splitlines():
                         parts = line.split()
                         if parts and parts[0].count(".") == 3 and "lladdr" in parts:
                             table[parts[0]] = parts[parts.index("lladdr") + 1].lower()
                 except Exception:
-                    out = subprocess.check_output(["arp", "-n"], text=True, errors="ignore")
+                    out = subprocess.check_output(["arp", "-n"], text=True, errors="ignore", **_NO_WINDOW)
                     for line in out.splitlines():
                         parts = line.split()
                         if (len(parts) >= 3 and parts[0].count(".") == 3
@@ -414,21 +459,61 @@ class AutoNetworkDiagrammer:
 
         Mirrors what nmap.PortScanner.scan() does internally, but keeps a
         handle to the Popen object so stop() can terminate it immediately
-        instead of waiting for the whole scan to finish.
+        instead of waiting for the whole scan to finish. Also streams stdout
+        live (rather than blocking on communicate()) so we can surface nmap's
+        own -v/--stats-every progress as a progress meter in the scan log.
 
         Returns True if the scan completed and results were parsed into
         self.scanner, or False if it was stopped before/while running.
         """
-        args = ([self.scanner._nmap_path, "-oX", "-"]
+        args = ([self.scanner._nmap_path, "-oX", "-", "-v", "--stats-every", "2s"]
                 + shlex.split(target) + shlex.split(arguments))
         with self._proc_lock:
             if self.stop_event.is_set():
                 return False
             self._current_proc = subprocess.Popen(
-                args, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                args, stdout=subprocess.PIPE, stderr=subprocess.PIPE, **_NO_WINDOW)
             proc = self._current_proc
 
-        out, err = proc.communicate()
+        chunks = []
+        progress_state = {"pct": -100.0, "ts": 0.0}
+
+        def _handle_progress(buf):
+            for m in _TASKPROGRESS_RE.finditer(buf):
+                attrs = dict(_XML_ATTR_RE.findall(m.group(1)))
+                try:
+                    pct = float(attrs.get(b"percent", b"0"))
+                except ValueError:
+                    continue
+                now = time.time()
+                if pct - progress_state["pct"] < 3 and now - progress_state["ts"] < 3:
+                    continue
+                progress_state["pct"] = pct
+                progress_state["ts"] = now
+                self.progress_cb(pct)
+                task = attrs.get(b"task", b"").decode(errors="ignore")
+                remaining = attrs.get(b"remaining")
+                elapsed = self._fmt_elapsed(now - (self.run_start_ts or now))
+                msg = f"     {self._ascii_bar(pct)} {pct:5.1f}%  {task}"
+                if remaining:
+                    msg += f"  (~{int(remaining)}s left)"
+                msg += f"  [{elapsed}]"
+                self.log(msg)
+
+        def _drain_stdout():
+            carry = b""
+            for chunk in iter(lambda: proc.stdout.read(4096), b""):
+                chunks.append(chunk)
+                buf = carry + chunk
+                _handle_progress(buf)
+                carry = buf[-200:]
+
+        t = threading.Thread(target=_drain_stdout, daemon=True)
+        t.start()
+        err = proc.stderr.read()
+        proc.wait()
+        t.join()
+        out = b"".join(chunks)
 
         with self._proc_lock:
             self._current_proc = None
@@ -584,6 +669,7 @@ class DiagrammerApp(tk.Tk):
         self.minsize(660, 720)
 
         self.log_queue = queue.Queue()
+        self.progress_queue = queue.Queue()
         self.output_file = None
         self.worker = None
         self.detected_gateway = None
@@ -764,6 +850,9 @@ class DiagrammerApp(tk.Tk):
     def _log(self, msg):
         self.log_queue.put(msg)
 
+    def _progress(self, pct):
+        self.progress_queue.put(pct)
+
     def _clear_log(self):
         self.log_widget.configure(state="normal")
         self.log_widget.delete("1.0", "end")
@@ -776,6 +865,16 @@ class DiagrammerApp(tk.Tk):
             self.log_widget.insert("end", msg + "\n")
             self.log_widget.see("end")
             self.log_widget.configure(state="disabled")
+
+        last_pct = None
+        while not self.progress_queue.empty():
+            last_pct = self.progress_queue.get_nowait()
+        if last_pct is not None:
+            if self.progress["mode"] != "determinate":
+                self.progress.stop()
+                self.progress.configure(mode="determinate", maximum=100)
+            self.progress["value"] = last_pct
+
         self.after(100, self._drain_log_queue)
 
     def _start_scan(self):
@@ -789,16 +888,23 @@ class DiagrammerApp(tk.Tk):
                 "Enter at least one network, or click 'Detect my network'.")
             return
 
-        self._save_config()
-        out = self.out_var.get().strip() or "auto_network_map.html"
         scan_name = self.name_var.get().strip() or self.history.next_name()
         self.name_var.set(scan_name)
         self.current_scan_id = self.history.add(scan_name, targets)
+
+        # Auto-name the output file per scan (scan_1.html, scan_2.html, ...)
+        # in whatever directory was last used, so every run gets its own file.
+        out_dir = (os.path.dirname(self.out_var.get().strip())
+                   or os.path.dirname(os.path.abspath(__file__)))
+        out = os.path.join(out_dir, f"scan_{self.current_scan_id}.html")
+        self.out_var.set(out)
+        self._save_config()
         self._refresh_history()
 
         self.scan_btn.configure(state="disabled")
         self.stop_btn.configure(state="normal")
         self.open_btn.configure(state="disabled")
+        self.progress.configure(mode="indeterminate")
         self.progress.start(12)
         self.status.set("Scanning…")
         self.stopping = False
@@ -818,7 +924,8 @@ class DiagrammerApp(tk.Tk):
     def _run_scan(self, targets, out):
         try:
             self.diag = AutoNetworkDiagrammer(log=self._log,
-                                              gateway_hint=self.detected_gateway)
+                                              gateway_hint=self.detected_gateway,
+                                              progress=self._progress)
             self.diag.scan_network(targets)
             path = self.diag.generate(out)
             self.output_file = os.path.abspath(path)
@@ -828,6 +935,8 @@ class DiagrammerApp(tk.Tk):
 
     def _scan_done(self, ok, err):
         self.progress.stop()
+        self.progress.configure(mode="indeterminate")
+        self.progress["value"] = 0
         self.scan_btn.configure(state="normal")
         self.stop_btn.configure(state="disabled")
         was_stopped = self.stopping
@@ -850,10 +959,16 @@ class DiagrammerApp(tk.Tk):
             status = "error"
 
         if self.current_scan_id is not None:
-            self.history.finish(self.current_scan_id, status, device_count,
+            finished_id = self.current_scan_id
+            self.history.finish(finished_id, status, device_count,
                                 self.output_file if ok else None)
             self.current_scan_id = None
             self._refresh_history()
+            # Auto-highlight the scan that just completed.
+            if self.history_tree.exists(str(finished_id)):
+                self.history_tree.selection_set(str(finished_id))
+                self.history_tree.focus(str(finished_id))
+                self.history_tree.see(str(finished_id))
         self.name_var.set(self.history.next_name())
 
         if not ok:

@@ -24,10 +24,13 @@ The exe is unsigned and self-built, so Windows SmartScreen may warn about an unk
 - **Editable targets** — scan any subnet (`192.168.1.0/24`) or single host (`10.0.0.5`), one per line.
 - **Deeper host discovery** — combines ARP, ICMP echo/timestamp, and TCP SYN/ACK probes so devices that drop plain ICMP still get found, with reverse-DNS + OS-resolver hostname lookups (and a Python-side fallback) for accurate IP/hostname pairs.
 - **Real edge topology** — traces the actual hop-by-hop path to every device (`nmap --traceroute`) and cross-references the OS ARP cache to confirm which devices sit on your local L2 segment, instead of just guessing a star around the router. A star-around-the-router guess is only used as a last resort for devices with no traceroute/ARP evidence.
-- **Runs in the background** so the window stays responsive, with a live scan log.
+- **Live progress meter and per-device timer** in the scan log — a running `[mm:ss]` elapsed stamp on every device found, plus a real percent-complete/ETA readout parsed straight from nmap's own progress stream.
+- **Runs in the background** so the window stays responsive, with no nmap console window flashing on top of it.
+- **Each scan gets its own output file** — `scan_1.html`, `scan_2.html`, and so on, so past diagrams are never overwritten by the next run.
+- **Auto-highlights the just-finished scan** in the Previous Scans list.
 - **Device-type coloring** for routers, switches, servers, NAS, DNS, APs, printers, cameras, phones, and workstations.
 - **Remembers your last targets** between runs.
-- **Interactive output** — pan/zoom/drag the generated `auto_network_map.html`.
+- **Interactive output** — pan/zoom/drag the generated HTML map.
 
 ## Requirements
 
@@ -51,7 +54,7 @@ Enter (or auto-detect) the networks to scan, click Scan & Generate, then Open Di
 
 ## How it works
 
-- Host discovery across each target range using ARP ping, ICMP echo/timestamp, and TCP SYN/ACK probes (`nmap -sn -PR -PE -PP -PS... -PA... -R --system-dns`), with a Python `socket.gethostbyaddr` fallback for any host nmap can't name.
+- Host discovery across each target range using ARP ping, ICMP echo/timestamp, and TCP SYN/ACK probes (`nmap -sn -PR -PE -PP -PS... -PA... -R`), with a Python `socket.gethostbyaddr` fallback for any host nmap can't name. (`-R` uses nmap's own fast async resolver rather than `--system-dns`, which is dramatically slower on hosts with no PTR record.)
 - `--traceroute` is enabled on every scan; since the `python-nmap` wrapper discards `<trace>` data, the raw nmap XML is parsed directly to recover the real hop-by-hop path to each host.
 - The OS ARP cache (`arp -a` / `ip neigh`) is read after each scan pass to fill in MACs nmap can't reach without raw-socket privileges, and to confirm which hosts are directly on your local L2 segment.
 - Each host becomes a node, typed and colored by hostname/IP heuristics.
