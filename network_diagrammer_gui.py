@@ -167,6 +167,13 @@ def _primary_ip():
         return None
 
 
+def _is_valid_ipv4(ip):
+    try:
+        return ipaddress.ip_address(ip).version == 4
+    except (ValueError, TypeError):
+        return False
+
+
 def _hexmask_to_prefix(hexstr):
     """Convert a macOS-style hex netmask (e.g. 0xffffff00) to a prefix int."""
     try:
@@ -261,16 +268,29 @@ def detect_local_subnets():
 
 
 def detect_default_gateway():
-    """Best-effort default gateway IP as a string, or None."""
+    """Best-effort default gateway IPv4 as a string, or None.
+
+    ipconfig lists the IPv6 gateway on the label line and the IPv4 one as a
+    bare continuation line below it (same layout as "DNS Servers"), so we
+    have to look past the first line to find the IPv4 address.
+    """
     try:
         if os.name == "nt":
             out = subprocess.check_output(
                 ["ipconfig"], text=True, errors="ignore", **_NO_WINDOW)
+            in_block = False
             for line in out.splitlines():
-                if "Default Gateway" in line and ":" in line:
-                    ip = line.split(":")[-1].strip()
-                    if ip and ip.count(".") == 3:
+                if "Default Gateway" in line and _IPCONFIG_LABEL_RE.search(line):
+                    ip = line.split(":", 1)[-1].strip()
+                    if _is_valid_ipv4(ip):
                         return ip
+                    in_block = True  # label matched but value is IPv6 (or empty)
+                elif in_block:
+                    stripped = line.strip()
+                    if not stripped or _IPCONFIG_LABEL_RE.search(line):
+                        in_block = False
+                    elif _is_valid_ipv4(stripped):
+                        return stripped
         else:
             out = subprocess.check_output(
                 ["ip", "route"], text=True, errors="ignore", **_NO_WINDOW)
@@ -284,16 +304,102 @@ def detect_default_gateway():
     return None
 
 
+# Matches an ipconfig/all label line like "DNS Servers . . . . . . . : ",
+# i.e. a run of dots (with optional spaces) right before the colon. Bare
+# continuation lines (just an IP, IPv4 or IPv6) never match this, which is
+# what lets us tell a real new label apart from another server address.
+_IPCONFIG_LABEL_RE = re.compile(r'\.\s*:')
+
+
+def detect_dns_servers():
+    """Best-effort list of DNS resolver IPv4s this machine is configured to use.
+
+    Reads every adapter's configured servers (ipconfig /all on Windows,
+    /etc/resolv.conf on POSIX, falling back to `nslookup`'s reported default
+    server if neither yields anything) so nmap's reverse-DNS lookups can be
+    pointed at your actual local resolvers via --dns-servers instead of
+    whatever nmap's own auto-detection finds -- useful since that detection
+    is known to be unreliable on Windows, and your network's real resolvers
+    may know local hostnames a generic one wouldn't.
+    """
+    servers = []
+    try:
+        if os.name == "nt":
+            out = subprocess.check_output(
+                ["ipconfig", "/all"], text=True, errors="ignore", **_NO_WINDOW)
+            in_block = False
+            for line in out.splitlines():
+                if "DNS Servers" in line and _IPCONFIG_LABEL_RE.search(line):
+                    ip = line.split(":", 1)[-1].strip()
+                    if ip:
+                        servers.append(ip)
+                    in_block = True
+                elif in_block:
+                    stripped = line.strip()
+                    if stripped and not _IPCONFIG_LABEL_RE.search(line):
+                        servers.append(stripped)  # bare continuation address
+                    else:
+                        in_block = False
+        else:
+            try:
+                with open("/etc/resolv.conf", "r", errors="ignore") as f:
+                    for line in f:
+                        parts = line.split()
+                        if len(parts) >= 2 and parts[0] == "nameserver":
+                            servers.append(parts[1])
+            except OSError:
+                pass
+    except Exception:
+        pass
+
+    if not servers:
+        # Cross-platform fallback: closing stdin makes `nslookup` print its
+        # "Default Server" banner and quit instead of waiting for a query.
+        try:
+            proc = subprocess.run(
+                ["nslookup"], stdin=subprocess.DEVNULL, capture_output=True,
+                text=True, errors="ignore", timeout=3, **_NO_WINDOW)
+            for line in proc.stdout.splitlines():
+                if line.strip().lower().startswith("address"):
+                    ip = line.split(":", 1)[-1].strip()
+                    if ip:
+                        servers.append(ip)
+        except Exception:
+            pass
+
+    cleaned = []
+    for ip in servers:
+        try:
+            addr = ipaddress.ip_address(ip)
+        except ValueError:
+            continue
+        if addr.version != 4 or addr.is_loopback:
+            continue
+        if ip not in cleaned:
+            cleaned.append(ip)
+    return cleaned
+
+
 # --------------------------------------------------------------------------- #
 #  Core scanning / diagram logic                                              #
 # --------------------------------------------------------------------------- #
 class AutoNetworkDiagrammer:
     def __init__(self, log=print, gateway_hint=None, stop_event=None, progress=None,
-                 dark_mode=False):
+                 dark_mode=False, dns_servers=None):
         self.log = log
         self.progress_cb = progress or (lambda pct: None)   # optional live % callback
         self.gateway_hint = gateway_hint      # optional detected gateway IP
         self.stop_event = stop_event or threading.Event()
+
+        # DNS servers to point reverse-DNS lookups at explicitly (via
+        # nmap --dns-servers), instead of trusting nmap's own auto-detection
+        # -- which is known to be unreliable on Windows, especially with
+        # multiple adapters/VLANs. The gateway is included too since routers
+        # commonly also resolve DHCP-lease hostnames locally.
+        dns_candidates = list(dns_servers or [])
+        if gateway_hint and gateway_hint not in dns_candidates:
+            dns_candidates.append(gateway_hint)
+        self.dns_servers = [ip for ip in dns_candidates if _is_valid_ipv4(ip)]
         self.run_start_ts = None
         self.dark_mode = dark_mode
         self._proc_lock = threading.Lock()
@@ -333,11 +439,20 @@ class AutoNetworkDiagrammer:
     # synchronous resolver, which is dramatically slower than nmap's own
     # async resolver for hosts with no PTR record (measured ~17x slower,
     # 79s vs 4.6s, on a 16-address /28 with several unnamed hosts).
-    NMAP_DISCOVERY_ARGS = (
+    _BASE_DISCOVERY_ARGS = (
         "-sn -PR -PE -PP "
         "-PS21,22,23,25,80,443,3389,8080 -PA21,22,80,443,3389 "
         "--traceroute -R --max-retries 2"
     )
+
+    def _discovery_args(self):
+        """Discovery args, pinning reverse-DNS lookups at our real resolvers
+        (self.dns_servers) when we have any, instead of nmap's own detection.
+        """
+        args = self._BASE_DISCOVERY_ARGS
+        if self.dns_servers:
+            args += " --dns-servers " + ",".join(self.dns_servers)
+        return args
 
     @staticmethod
     def _fmt_elapsed(seconds):
@@ -387,7 +502,10 @@ class AutoNetworkDiagrammer:
 
     def scan_network(self, targets):
         self.log("\U0001F50D Scanning...")
+        if self.dns_servers:
+            self.log(f"  Using DNS resolver(s) for hostname lookups: {', '.join(self.dns_servers)}")
         self.run_start_ts = time.time()
+        discovery_args = self._discovery_args()
         for target in targets:
             if self.stop_event.is_set():
                 self.log("⏹ Stopped by user.")
@@ -398,7 +516,7 @@ class AutoNetworkDiagrammer:
             self.log(f"  → {target}")
             skip_ips = self._network_broadcast_ips(target)
             try:
-                if not self._run_nmap(target, arguments=self.NMAP_DISCOVERY_ARGS):
+                if not self._run_nmap(target, arguments=discovery_args):
                     self.log("⏹ Stopped by user.")
                     break
                 self._refresh_arp_table()
@@ -1089,8 +1207,15 @@ class DiagrammerApp(tk.Tk):
         self.stopping = False
         self._log(f"--- Run started {datetime.now():%Y-%m-%d %H:%M:%S} ---")
 
+        # Detected fresh every run (rather than relying on self.detected_gateway,
+        # which is only set when "Detect my network" actually runs — it's
+        # skipped whenever there are saved targets, i.e. most launches).
+        dns_servers = detect_dns_servers()
+        gateway = detect_default_gateway() or self.detected_gateway
+
         self.worker = threading.Thread(
-            target=self._run_scan, args=(targets, out, self.dark_mode_var.get()), daemon=True)
+            target=self._run_scan,
+            args=(targets, out, self.dark_mode_var.get(), dns_servers, gateway), daemon=True)
         self.worker.start()
 
     def _stop_scan(self):
@@ -1100,12 +1225,13 @@ class DiagrammerApp(tk.Tk):
             self.status.set("Stopping…")
             self.diag.stop()
 
-    def _run_scan(self, targets, out, dark_mode):
+    def _run_scan(self, targets, out, dark_mode, dns_servers, gateway):
         try:
             self.diag = AutoNetworkDiagrammer(log=self._log,
-                                              gateway_hint=self.detected_gateway,
+                                              gateway_hint=gateway,
                                               progress=self._progress,
-                                              dark_mode=dark_mode)
+                                              dark_mode=dark_mode,
+                                              dns_servers=dns_servers)
             self.diag.scan_network(targets)
             path = self.diag.generate(out)
             self.output_file = os.path.abspath(path)

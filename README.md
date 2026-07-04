@@ -23,6 +23,7 @@ The exe is unsigned and self-built, so Windows SmartScreen may warn about an unk
 - **Auto-detects your network** on launch — nothing to configure to get started.
 - **Editable targets** — scan any subnet (`192.168.1.0/24`) or single host (`10.0.0.5`), one per line.
 - **Deeper host discovery** — combines ARP, ICMP echo/timestamp, and TCP SYN/ACK probes so devices that drop plain ICMP still get found, with reverse-DNS + a bounded socket-resolver fallback for accurate IP/hostname pairs.
+- **Uses your real DNS resolvers** — reverse-DNS lookups are pinned to the DNS servers your OS is actually configured with (plus your gateway) instead of trusting nmap's own resolver auto-detection, which is known to be unreliable on Windows.
 - **Filters out phantom hosts** — some routers/firewalls answer discovery probes for IPs nothing is actually using; an address only becomes a node if it has a real hostname or an ARP-confirmed unicast MAC, and the subnet's network/broadcast addresses are always excluded.
 - **Real edge topology** — traces the actual hop-by-hop path to every device (`nmap --traceroute`) and cross-references the OS ARP cache to confirm which devices sit on your local L2 segment, instead of just guessing a star around the router. A star-around-the-router guess is only used as a last resort for devices with no traceroute/ARP evidence.
 - **Live progress meter and per-device timer** in the scan log — a running `[mm:ss]` elapsed stamp on every device found, plus a real percent-complete/ETA readout parsed straight from nmap's own progress stream.
@@ -57,6 +58,7 @@ Enter (or auto-detect) the networks to scan, click Scan & Generate, then Open Di
 ## How it works
 
 - Host discovery across each target range using ARP ping, ICMP echo/timestamp, and TCP SYN/ACK probes (`nmap -sn -PR -PE -PP -PS... -PA... -R`), with a Python `socket.gethostbyaddr` fallback for any host nmap can't name. (`-R` uses nmap's own fast async resolver rather than `--system-dns`, which is dramatically slower on hosts with no PTR record.)
+- Before each scan, the app reads your OS's actual configured DNS servers (`ipconfig /all` on Windows, `/etc/resolv.conf` on POSIX, falling back to `nslookup`'s reported default) and your gateway, then passes them to nmap via `--dns-servers` so reverse lookups hit your real resolvers — handy if you run multiple local DNS servers and want the authoritative one(s) queried instead of whatever nmap picks on its own.
 - `--traceroute` is enabled on every scan; since the `python-nmap` wrapper discards `<trace>` data, the raw nmap XML is parsed directly to recover the real hop-by-hop path to each host.
 - The OS ARP cache (`arp -a` / `ip neigh`) is read after each scan pass to fill in MACs nmap can't reach without raw-socket privileges, and to confirm which hosts are directly on your local L2 segment.
 - Each host becomes a node, typed and colored by hostname/IP heuristics.
