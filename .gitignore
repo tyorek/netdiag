@@ -18,6 +18,7 @@ nmap-*-setup.exe
 
 # ---- App runtime output / user settings ----
 diagrammer_config.json
+scan_history.db
 auto_network_map.html
 *.html
 # keep any docs/ html if you add it later:
