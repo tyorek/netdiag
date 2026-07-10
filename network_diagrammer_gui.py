@@ -23,6 +23,7 @@ Run:
 import os
 import re
 import json
+import base64
 import shlex
 import socket
 import sqlite3
@@ -83,6 +84,82 @@ THEMES = {
         button_bg="#3c3c3c", button_fg="#e6e6e6",
         progress_trough="#333333", progress_bar="#3a9d4f",
         muted_fg="#a0a0a0",
+    ),
+}
+
+# Hand-drawn line-icon glyphs (48x48 viewBox) for each device type, drawn as
+# white stroke/fill shapes so they read clearly once laid over a colored
+# circle badge (see AutoNetworkDiagrammer._device_icon_data_uri). Kept as
+# plain SVG primitives -- no external icon font/library -- so the generated
+# diagram stays a single self-contained HTML file with no network fetch.
+_DEVICE_ICON_GLYPHS = {
+    "router": (
+        '<rect x="14" y="26" width="20" height="10" rx="2"/>'
+        '<line x1="18" y1="26" x2="14" y2="16"/>'
+        '<line x1="30" y1="26" x2="34" y2="16"/>'
+        '<circle cx="18" cy="31" r="1.3" fill="#fff" stroke="none"/>'
+        '<circle cx="24" cy="31" r="1.3" fill="#fff" stroke="none"/>'
+        '<circle cx="30" cy="31" r="1.3" fill="#fff" stroke="none"/>'
+    ),
+    "switch": (
+        '<rect x="12" y="20" width="24" height="12" rx="2"/>'
+        '<line x1="16" y1="27" x2="16" y2="30"/>'
+        '<line x1="21" y1="27" x2="21" y2="30"/>'
+        '<line x1="27" y1="27" x2="27" y2="30"/>'
+        '<line x1="32" y1="27" x2="32" y2="30"/>'
+    ),
+    "server": (
+        '<rect x="13" y="12" width="22" height="7" rx="1"/>'
+        '<rect x="13" y="21" width="22" height="7" rx="1"/>'
+        '<rect x="13" y="30" width="22" height="7" rx="1"/>'
+        '<circle cx="17" cy="15.5" r="1" fill="#fff" stroke="none"/>'
+        '<circle cx="17" cy="24.5" r="1" fill="#fff" stroke="none"/>'
+        '<circle cx="17" cy="33.5" r="1" fill="#fff" stroke="none"/>'
+    ),
+    "nas": (
+        '<rect x="16" y="10" width="16" height="28" rx="2"/>'
+        '<line x1="16" y1="24" x2="32" y2="24"/>'
+        '<circle cx="27" cy="16" r="1.2" fill="#fff" stroke="none"/>'
+        '<circle cx="27" cy="30" r="1.2" fill="#fff" stroke="none"/>'
+    ),
+    "dns": (
+        '<ellipse cx="24" cy="14" rx="10" ry="4"/>'
+        '<line x1="14" y1="14" x2="14" y2="32"/>'
+        '<line x1="34" y1="14" x2="34" y2="32"/>'
+        '<path d="M14,23 A10,4 0 0 0 34,23" fill="none"/>'
+        '<path d="M14,32 A10,4 0 0 0 34,32" fill="none"/>'
+    ),
+    "ap": (
+        '<circle cx="24" cy="34" r="1.6" fill="#fff" stroke="none"/>'
+        '<path d="M18,34 A6,6 0 0 1 30,34" fill="none"/>'
+        '<path d="M13,34 A11,11 0 0 1 35,34" fill="none"/>'
+        '<path d="M8,34 A16,16 0 0 1 40,34" fill="none"/>'
+    ),
+    "printer": (
+        '<rect x="17" y="10" width="14" height="5" rx="1"/>'
+        '<rect x="12" y="15" width="24" height="13" rx="2"/>'
+        '<rect x="17" y="28" width="14" height="8" rx="1"/>'
+        '<circle cx="32" cy="20" r="1.3" fill="#fff" stroke="none"/>'
+    ),
+    "camera": (
+        '<rect x="10" y="18" width="24" height="16" rx="3"/>'
+        '<rect x="16" y="13" width="9" height="6" rx="1"/>'
+        '<circle cx="22" cy="26" r="5"/>'
+        '<rect x="30" y="21" width="3" height="2" fill="#fff" stroke="none"/>'
+    ),
+    "phone": (
+        '<rect x="17" y="8" width="14" height="30" rx="3"/>'
+        '<circle cx="24" cy="34" r="1.3" fill="#fff" stroke="none"/>'
+        '<line x1="21" y1="12" x2="27" y2="12"/>'
+    ),
+    "workstation": (
+        '<rect x="11" y="10" width="26" height="17" rx="2"/>'
+        '<line x1="24" y1="27" x2="24" y2="32"/>'
+        '<line x1="17" y1="32" x2="31" y2="32"/>'
+    ),
+    "scanner": (
+        '<rect x="14" y="9" width="20" height="14" rx="2"/>'
+        '<path d="M9,26 L39,26 L35,32 L13,32 Z" fill="none"/>'
     ),
 }
 
@@ -417,13 +494,15 @@ class AutoNetworkDiagrammer:
                            directed=False, notebook=False,
                            bgcolor=bgcolor, font_color=font_color)
         self.net.set_options(json.dumps({
-            "nodes": {"shape": "dot", "size": 28, "font": {"size": 15}},
+            "nodes": {"shape": "dot", "size": 32, "font": {"size": 15}},
             "edges": {"smooth": {"type": "dynamic"},
                       "font": {"size": 10, "color": edge_font_color},
                       "color": edge_color},
             "physics": {"stabilization": {"iterations": 2000}}
         }))
         self.router_ip = None
+        self._icon_cache = {}           # device_type -> data URI, built once per type
+        self.used_device_types = set()  # device types actually placed on the map, for the legend
         self.device_count = 0
         self.unconfirmed_count = 0
         self.local_ip = _primary_ip()
@@ -559,8 +638,9 @@ class AutoNetworkDiagrammer:
                              f"MAC: {mac}\nSubnet: {self.get_subnet(host)}")
 
                     self.G.add_node(host, label=label, title=title, group=device_type)
-                    self.net.add_node(host, label=label, title=title,
-                                      color=self.get_color(device_type))
+                    self.net.add_node(host, label=label, title=title, shape="image",
+                                      image=self._device_icon_data_uri(device_type))
+                    self.used_device_types.add(device_type)
                     self.device_count += 1
                     elapsed = self._fmt_elapsed(time.time() - self.run_start_ts)
                     self.log(f"     ✓ [{elapsed}] {hostname} ({host})")
@@ -761,8 +841,9 @@ class AutoNetworkDiagrammer:
             label = f"This PC\n{local_node}"
             title = f"Scanning host\nIP: {local_node}"
             self.G.add_node(local_node, label=label, title=title, group="scanner")
-            self.net.add_node(local_node, label=label, title=title,
-                              color=self.get_color("scanner"))
+            self.net.add_node(local_node, label=label, title=title, shape="image",
+                              image=self._device_icon_data_uri("scanner"))
+            self.used_device_types.add("scanner")
 
         seen_edges = set()
         linked_nodes = {local_node}  # nodes that already have a real edge
@@ -793,8 +874,9 @@ class AutoNetworkDiagrammer:
                     label = f"{hop_label}\n{hop_ip}"
                     title = f"IP: {hop_ip}\n(routing hop, not directly scanned)"
                     self.G.add_node(hop_ip, label=label, title=title, group="router")
-                    self.net.add_node(hop_ip, label=label, title=title,
-                                      color=self.get_color("router"))
+                    self.net.add_node(hop_ip, label=label, title=title, shape="image",
+                                      image=self._device_icon_data_uri("router"))
+                    self.used_device_types.add("router")
                 chain.append(hop_ip)
             if chain[-1] != host:
                 chain.append(host)
@@ -860,14 +942,75 @@ class AutoNetworkDiagrammer:
         }
         return colors.get(device_type, "#3498db")
 
+    def _device_icon_data_uri(self, device_type):
+        """A self-contained base64 SVG data URI: a colored circle badge
+        (get_color) with the device type's line-icon glyph on top, used as
+        the node 'image' so devices read at a glance instead of as
+        same-shaped colored dots.
+        """
+        if device_type in self._icon_cache:
+            return self._icon_cache[device_type]
+        glyph = _DEVICE_ICON_GLYPHS.get(device_type, _DEVICE_ICON_GLYPHS["workstation"])
+        svg = (
+            '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 48 48">'
+            f'<circle cx="24" cy="24" r="22" fill="{self.get_color(device_type)}"/>'
+            '<g fill="none" stroke="#ffffff" stroke-width="2.2" '
+            f'stroke-linecap="round" stroke-linejoin="round">{glyph}</g></svg>'
+        )
+        uri = "data:image/svg+xml;base64," + base64.b64encode(svg.encode("utf-8")).decode("ascii")
+        self._icon_cache[device_type] = uri
+        return uri
+
+    # Display order/labels for the legend, matching get_color's key order.
+    _DEVICE_LABELS = [
+        ("router", "Router"), ("switch", "Switch"), ("server", "Server"),
+        ("nas", "NAS"), ("dns", "DNS Server"), ("ap", "Access Point"),
+        ("printer", "Printer"), ("camera", "Camera"), ("phone", "Phone"),
+        ("workstation", "Workstation"), ("scanner", "This PC (scan host)"),
+    ]
+
     def generate(self, output_file="auto_network_map.html"):
         self.add_topology_edges()
         self.net.from_nx(self.G)
         self.net.write_html(output_file)
         if self.dark_mode:
             self._darken_page_chrome(output_file)
+        self._inject_legend(output_file)
         self.log(f"✅ Diagram saved: {output_file}")
         return output_file
+
+    def _inject_legend(self, output_file):
+        """Add a fixed-position icon legend for the device types actually
+        present on this map (only types placed on the graph are listed),
+        using the same icon badges as the diagram nodes for easy matching.
+        """
+        if not self.used_device_types:
+            return
+        if self.dark_mode:
+            bg, fg, border = "#1e1e1e", "#e6e6e6", "#3a3a3a"
+        else:
+            bg, fg, border = "#ffffff", "#000000", "#cccccc"
+        rows = "".join(
+            f'<div style="display:flex;align-items:center;margin:4px 0;">'
+            f'<img src="{self._device_icon_data_uri(dtype)}" width="20" height="20" '
+            f'style="margin-right:8px;flex-shrink:0;"><span>{label}</span></div>'
+            for dtype, label in self._DEVICE_LABELS if dtype in self.used_device_types
+        )
+        legend_html = (
+            '<div id="legend" style="position:fixed;bottom:20px;left:20px;'
+            f'background:{bg};color:{fg};border:1px solid {border};'
+            'border-radius:6px;padding:10px 14px;font-family:sans-serif;'
+            'font-size:13px;z-index:1000;box-shadow:0 2px 6px rgba(0,0,0,0.3);">'
+            f'<div style="font-weight:bold;margin-bottom:6px;">Legend</div>{rows}</div>'
+        )
+        try:
+            with open(output_file, "r", encoding="utf-8") as f:
+                html = f.read()
+            html = html.replace("</body>", legend_html + "</body>")
+            with open(output_file, "w", encoding="utf-8") as f:
+                f.write(html)
+        except OSError:
+            pass
 
     @staticmethod
     def _darken_page_chrome(output_file):
