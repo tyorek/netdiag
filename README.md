@@ -3,8 +3,11 @@
 A clickable desktop app that scans one or more IP networks with **nmap**, maps real edge topology from **traceroute** hops and **ARP** cache data, and renders an interactive HTML map using **pyvis**. No networks are hardcoded — it auto-detects the subnet your machine is on, and you can add or edit targets freely.
 
 ![status](https://img.shields.io/badge/status-working-brightgreen)
+![version](https://img.shields.io/badge/version-1.0.0-informational)
 ![python](https://img.shields.io/badge/python-3.9%2B-blue)
 ![license](https://img.shields.io/badge/license-GPLv3-blue)
+
+See [CHANGELOG.md](CHANGELOG.md) for release history.
 
 ## Download (no install / Windows)
 
@@ -31,7 +34,7 @@ The exe is unsigned and self-built, so Windows SmartScreen may warn about an unk
 - **Each scan gets its own output file** — `scan_1.html`, `scan_2.html`, and so on, so past diagrams are never overwritten by the next run.
 - **Auto-highlights the just-finished scan** in the Previous Scans list.
 - **Dark mode** — toggle with the 🌙 button in the top-right; themes both the app window and the generated diagram, and is remembered between runs.
-- **Device-type coloring** for routers, switches, servers, NAS, DNS, APs, printers, cameras, phones, and workstations.
+- **Device-type icons** — routers, switches, servers, NAS, DNS, APs, printers, cameras, phones, and workstations each get a distinct hand-drawn icon (not just a color), so device types are clear at a glance instead of same-shaped colored dots. Every diagram also gets an auto-generated legend listing only the device types actually found.
 - **Remembers your last targets** between runs.
 - **Interactive output** — pan/zoom/drag the generated HTML map.
 
@@ -61,9 +64,9 @@ Enter (or auto-detect) the networks to scan, click Scan & Generate, then Open Di
 - Before each scan, the app reads your OS's actual configured DNS servers (`ipconfig /all` on Windows, `/etc/resolv.conf` on POSIX, falling back to `nslookup`'s reported default) and your gateway, then passes them to nmap via `--dns-servers` so reverse lookups hit your real resolvers — handy if you run multiple local DNS servers and want the authoritative one(s) queried instead of whatever nmap picks on its own.
 - `--traceroute` is enabled on every scan; since the `python-nmap` wrapper discards `<trace>` data, the raw nmap XML is parsed directly to recover the real hop-by-hop path to each host.
 - The OS ARP cache (`arp -a` / `ip neigh`) is read after each scan pass to fill in MACs nmap can't reach without raw-socket privileges, and to confirm which hosts are directly on your local L2 segment.
-- Each host becomes a node, typed and colored by hostname/IP heuristics.
+- Each host becomes a node, typed by hostname/IP heuristics and drawn with a matching icon (baked as a base64 SVG, so the map stays a single self-contained file — no external image files or fonts).
 - Edges are built in priority order: real traceroute hop chains first (adding intermediate routers you didn't scan directly), then ARP-confirmed direct links, and only as a last resort — for devices with neither signal — an inferred link to the detected/guessed router.
-- pyvis writes a self-contained interactive HTML map.
+- pyvis writes a self-contained interactive HTML map, with a legend for the device-type icons actually present added alongside it.
 
 > Traceroute and ARP-based host discovery need raw-socket access — run the app as Administrator (Windows) / root (Linux/macOS) for the fullest, most accurate topology. Without elevated privileges, nmap falls back to what it can do unprivileged and more devices will land on the inferred-star fallback.
 

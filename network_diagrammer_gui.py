@@ -44,6 +44,9 @@ import networkx as nx
 from pyvis.network import Network
 
 
+# Bump on every user-visible change and record it in CHANGELOG.md.
+APP_VERSION = "1.0.0"
+
 # Where we remember the user's last-used settings (next to the exe/script).
 CONFIG_PATH = os.path.join(
     os.path.dirname(os.path.abspath(__file__)), "diagrammer_config.json")
@@ -1043,7 +1046,7 @@ class AutoNetworkDiagrammer:
 class DiagrammerApp(tk.Tk):
     def __init__(self):
         super().__init__()
-        self.title("Auto Network Diagrammer")
+        self.title(f"Auto Network Diagrammer v{APP_VERSION}")
         self.geometry("780x900")
         self.minsize(660, 720)
 
